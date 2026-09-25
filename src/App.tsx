@@ -1,42 +1,257 @@
-import { useEffect, useMemo, useRef, useState } from 'react';
-import { Check, ChevronRight, Clock3, Mic, Pause, Play, Plus, RotateCcw, Search, Trash2, Volume2 } from 'lucide-react';
+import { useEffect, useMemo, useState } from 'react';
+import { Download, Globe, Lock, Scale, RotateCcw } from 'lucide-react';
+import ImportPanel from './components/ImportPanel';
+import ResultsPanel from './components/ResultsPanel';
+import {
+  analyzeLicenses,
+  type DependencyEntry,
+  type Distribution,
+  type LicenseFinding,
+  type RiskLevel,
+} from './license/rules';
+import { nextId, parseManifest } from './license/parse';
+import { buildMarkdownReport, DISTRIBUTION_LABEL } from './license/report';
 
-type Phrase = { id: number; text: string; translation: string; tag: string; level: '入门'|'进阶'|'挑战'; status: 'new'|'practice'|'mastered'; attempts: number; last?: string };
-const seed: Phrase[] = [
-  { id: 1, text: 'The morning light feels different today.', translation: '今天的晨光感觉不一样。', tag: '日常', level: '入门', status: 'practice', attempts: 3, last: '今天 09:24' },
-  { id: 2, text: 'Could you walk me through the next step?', translation: '你能带我了解下一步吗？', tag: '工作', level: '进阶', status: 'new', attempts: 0 },
-  { id: 3, text: 'I appreciate your patience and thoughtful feedback.', translation: '感谢你的耐心和细致反馈。', tag: '表达', level: '挑战', status: 'mastered', attempts: 8, last: '昨天 18:10' },
-  { id: 4, text: 'Let’s make room for a little curiosity.', translation: '给好奇心留一点空间。', tag: '灵感', level: '入门', status: 'new', attempts: 0 },
-];
-const bars = Array.from({ length: 68 }, (_, i) => 18 + ((i * 29) % 44));
+type StatusTone = 'info' | 'warn' | 'ok';
+type Filter = 'all' | RiskLevel;
+
+const SAMPLE = [
+  'react@18.3.1 MIT',
+  'lodash@4.17.21 MIT',
+  'sharp@0.33.4 Apache-2.0',
+  'some-proprietary@1.0.0 Proprietary',
+  'legacy-gpl@2.4.0 GPL-3.0',
+  'net-service@5.1.0 AGPL-3.0',
+  'linked-codec@1.8.2 LGPL-2.1-only',
+  'axios@1.7.2 MIT',
+  'zod@3.23.8 MIT',
+  'mystery-lib@0.9.0',
+].join('\n');
+
+const STORAGE_KEY = 'license-lens:v1';
+
+function loadStored(): { entries: DependencyEntry[]; distribution: Distribution } | null {
+  try {
+    const raw = localStorage.getItem(STORAGE_KEY);
+    if (!raw) return null;
+    const data = JSON.parse(raw) as { entries?: unknown; distribution?: unknown };
+    if (!Array.isArray(data.entries)) return null;
+    const entries: DependencyEntry[] = data.entries
+      .filter((item): item is Record<string, unknown> => !!item && typeof item === 'object')
+      .map(item => ({
+        id: String(item.id ?? nextId()),
+        name: String(item.name ?? ''),
+        version: String(item.version ?? '—'),
+        license: String(item.license ?? ''),
+      }))
+      .filter(item => item.name);
+    return {
+      entries,
+      distribution: data.distribution === 'open' ? 'open' : 'closed',
+    };
+  } catch {
+    return null;
+  }
+}
 
 export default function App() {
-  const [phrases, setPhrases] = useState<Phrase[]>(() => { try { return JSON.parse(localStorage.getItem('sound-lab-phrases') || '') || seed; } catch { return seed; } });
-  const [selected, setSelected] = useState(phrases[0]?.id ?? 1);
-  const [filter, setFilter] = useState('全部');
+  // 新增、筛选、导出共用的唯一结果来源：findings 由 entries + 分发方式统一推导。
+  const stored = useMemo(loadStored, []);
+  const [entries, setEntries] = useState<DependencyEntry[]>(stored?.entries ?? []);
+  const [distribution, setDistribution] = useState<Distribution>(stored?.distribution ?? 'closed');
+  const [input, setInput] = useState('');
+  const [status, setStatus] = useState('');
+  const [statusTone, setStatusTone] = useState<StatusTone>('info');
+  const [analyzing, setAnalyzing] = useState(false);
+  const [filter, setFilter] = useState<Filter>('all');
   const [query, setQuery] = useState('');
-  const [recording, setRecording] = useState(false);
-  const [playing, setPlaying] = useState(false);
-  const [recorded, setRecorded] = useState(false);
-  const [seconds, setSeconds] = useState(0);
-  const [showAdd, setShowAdd] = useState(false);
-  const [newText, setNewText] = useState('');
-  const timer = useRef<number | undefined>(undefined);
-  const current = phrases.find(p => p.id === selected) ?? phrases[0];
-  const filtered = useMemo(() => phrases.filter(p => (filter === '全部' || p.tag === filter || p.level === filter || (filter === '待练' && p.status !== 'mastered')) && p.text.toLowerCase().includes(query.toLowerCase())), [phrases, filter, query]);
-  const tags = ['全部', ...Array.from(new Set(phrases.map(p => p.tag)))];
-  useEffect(() => { localStorage.setItem('sound-lab-phrases', JSON.stringify(phrases)); }, [phrases]);
-  useEffect(() => () => window.clearInterval(timer.current), []);
-  const startRecord = () => { if (recording) { setRecording(false); window.clearInterval(timer.current); setRecorded(true); setPhrases(ps => ps.map(p => p.id === selected ? {...p, attempts: p.attempts + 1, status: 'practice', last: '刚刚'} : p)); return; } setSeconds(0); setRecording(true); timer.current = window.setInterval(() => setSeconds(s => s + 1), 1000); };
-  const addPhrase = () => { if (!newText.trim()) return; const id = Date.now(); setPhrases(ps => [...ps, { id, text: newText.trim(), translation: '待补充译文', tag: '自定义', level: '入门', status: 'new', attempts: 0 }]); setSelected(id); setNewText(''); setShowAdd(false); };
-  const removePhrase = () => { if (!current) return; setPhrases(ps => ps.filter(p => p.id !== current.id)); setSelected(filtered.find(p => p.id !== current.id)?.id ?? phrases.find(p => p.id !== current.id)?.id ?? 0); };
-  return <div className="app-shell">
-    <aside className="sidebar"><div className="brand"><div className="brand-mark"><Volume2 size={19}/></div><div><strong>声线练习室</strong><span>Pronounce / practice</span></div></div><div className="side-label">我的练习</div><nav><button className="side-link active"><Mic size={17}/>练习库 <b>{phrases.length}</b></button><button className="side-link"><Clock3 size={17}/>练习记录</button><button className="side-link"><Check size={17}/>已掌握 <b>{phrases.filter(p => p.status === 'mastered').length}</b></button></nav><div className="sidebar-foot"><div className="streak"><span>连续练习</span><strong>5 <small>天</small></strong><i>↗ +2</i></div><div className="profile"><div className="avatar">YL</div><div><strong>Yuki Lin</strong><span>普通计划</span></div><ChevronRight size={16}/></div></div></aside>
-    <main className="main"><header className="topbar"><div><p className="eyebrow">WEDNESDAY, SEP 12</p><h1>今天练什么？</h1></div><div className="top-actions"><div className="search"><Search size={16}/><input value={query} onChange={e => setQuery(e.target.value)} placeholder="搜索句子"/></div><button className="primary" onClick={() => setShowAdd(true)}><Plus size={17}/>添加句子</button></div></header>
-      <section className="stats"><div><span>本周完成</span><strong>12 <em>/ 20</em></strong><div className="progress"><i style={{width:'60%'}}/></div></div><div><span>练习时长</span><strong>38 <em>分钟</em></strong><small>比上周多 8 分钟</small></div><div><span>最佳发音</span><strong>92 <em>分</em></strong><small className="green">↑ 6 分</small></div></section>
-      <div className="content-grid"><section className="library"><div className="section-head"><div><h2>句子库</h2><p>选择一句开始你的声音训练</p></div><button className="ghost" onClick={() => setFilter('待练')}>只看待练</button></div><div className="filters">{tags.map(t => <button key={t} className={filter === t ? 'chip active' : 'chip'} onClick={() => setFilter(t)}>{t}</button>)}</div><div className="phrase-list">{filtered.map(p => <button key={p.id} onClick={() => {setSelected(p.id); setRecorded(false)}} className={p.id === selected ? 'phrase selected' : 'phrase'}><div className="phrase-icon">{p.status === 'mastered' ? <Check size={15}/> : <Mic size={15}/>}</div><div className="phrase-copy"><strong>{p.text}</strong><span>{p.translation}</span><div className="phrase-meta"><i>{p.tag}</i><i>{p.level}</i>{p.attempts > 0 && <small>{p.attempts} 次练习</small>}</div></div><ChevronRight size={17}/></button>)}{filtered.length === 0 && <div className="empty">没有找到匹配句子</div>}</div></section>
-        {current && <section className="practice"><div className="practice-head"><div><span className="label">CURRENT PHRASE</span><h2>跟着感觉读</h2></div><button className="icon-btn" onClick={removePhrase} title="删除句子"><Trash2 size={17}/></button></div><div className="focus-card"><div className="focus-tag">{current.tag} · {current.level}</div><p className="focus-text">{current.text}</p><p className="focus-translation">{current.translation}</p><div className="audio-sample"><button className="round-btn" onClick={() => setPlaying(!playing)}>{playing ? <Pause size={18}/> : <Play size={18}/>}</button><div className="sample-wave">{bars.map((h,i) => <i key={i} style={{height: `${h * (playing ? 1.15 : 0.72)}%`}}/> )}</div><span>0:08</span></div></div><div className="record-card"><div className="record-top"><div><span className="label">YOUR RECORDING</span><h3>{recorded ? '录音已保存，听听自己的声音' : '准备好后开始录音'}</h3></div><span className="record-time">{String(Math.floor(seconds / 60)).padStart(2,'0')}:{String(seconds % 60).padStart(2,'0')}</span></div><div className="record-wave">{bars.slice(5,58).map((h,i) => <i key={i} className={recording ? 'live' : ''} style={{height: `${h * (recording ? (0.4 + ((i%5)/7)) : 0.4)}%`}}/> )}</div><div className="record-actions"><button className={recording ? 'record-button recording' : 'record-button'} onClick={startRecord}><span>{recording ? <Pause size={16}/> : <Mic size={16}/>}</span>{recording ? '结束录音' : recorded ? '重新录音' : '开始录音'}</button>{recorded && <button className="secondary" onClick={() => setPlaying(!playing)}>{playing ? <Pause size={15}/> : <Play size={15}/>} 回放</button>}</div></div><div className="tip"><span>练习小贴士</span><p>放慢速度，先把每个音节读清楚，再自然地连起来。</p><RotateCcw size={15}/></div></section>}
-      </div>
-    </main>{showAdd && <div className="modal-backdrop" onClick={() => setShowAdd(false)}><div className="modal" onClick={e => e.stopPropagation()}><div className="modal-head"><h2>添加练习句子</h2><button className="icon-btn" onClick={() => setShowAdd(false)}>×</button></div><label>英文句子<textarea autoFocus value={newText} onChange={e => setNewText(e.target.value)} placeholder="例如：I can make this happen."/></label><div className="modal-actions"><button className="secondary" onClick={() => setShowAdd(false)}>取消</button><button className="primary" onClick={addPhrase}>加入句子库</button></div></div></div>}
-  </div>;
+  const [selectedId, setSelectedId] = useState<string | null>(null);
+
+  const findings: LicenseFinding[] = useMemo(
+    () => analyzeLicenses(entries, distribution),
+    [entries, distribution],
+  );
+
+  useEffect(() => {
+    localStorage.setItem(STORAGE_KEY, JSON.stringify({ entries, distribution }));
+  }, [entries, distribution]);
+
+  const flash = (message: string, tone: StatusTone = 'info') => {
+    setStatus(message);
+    setStatusTone(tone);
+  };
+
+  const runAnalysis = (text: string): boolean => {
+    if (!text.trim()) {
+      setEntries([]);
+      flash('清单为空：请先粘贴或上传依赖清单，也可点击“载入示例”。', 'warn');
+      return false;
+    }
+    const { entries: parsed, format } = parseManifest(text);
+    if (parsed.length === 0) {
+      flash('未能从清单中解析出任何依赖，请检查格式（名称@版本 许可证）。', 'warn');
+      return false;
+    }
+    setEntries(parsed);
+    setSelectedId(null);
+    setFilter('all');
+    const unknown = parsed.filter(e => !e.license).length;
+    const note = format === 'json' ? '（JSON 清单）' : '';
+    flash(
+      `分析完成${note}：共 ${parsed.length} 条依赖${unknown ? `，其中 ${unknown} 条缺少许可证、需补录` : ''}。`,
+      unknown ? 'warn' : 'ok',
+    );
+    return true;
+  };
+
+  const handleAnalyze = () => {
+    setAnalyzing(true);
+    // 保留轻微延迟以反馈分析动作；解析本身是同步的纯计算。
+    window.setTimeout(() => {
+      runAnalysis(input);
+      setAnalyzing(false);
+    }, 180);
+  };
+
+  const handleFileContent = (content: string, fileName: string) => {
+    setInput(content);
+    if (runAnalysis(content)) flash(`已导入并分析「${fileName}」。`, 'ok');
+  };
+
+  const handleLoadSample = () => {
+    setInput(SAMPLE);
+    runAnalysis(SAMPLE);
+  };
+
+  const handleAdd = (name: string, version: string, license: string) => {
+    const key = `${name}@${version}`;
+    const existing = entries.find(e => `${e.name}@${e.version}` === key);
+    if (existing) {
+      setEntries(list => list.map(e => (e.id === existing.id ? { ...e, license } : e)));
+      flash(`已更新 ${name}@${version} 的许可证为 ${license}。`, 'ok');
+    } else {
+      setEntries(list => [...list, { id: nextId(), name, version, license }]);
+      flash(`已新增 ${name}@${version}（${license}）并并入分析结果。`, 'ok');
+    }
+    setSelectedId(null);
+  };
+
+  const handleSupplement = (id: string, license: string) => {
+    setEntries(list => list.map(e => (e.id === id ? { ...e, license } : e)));
+    const target = entries.find(e => e.id === id);
+    if (target) flash(`已为 ${target.name} 补录许可证 ${license}，风险结论已重新判定。`, 'ok');
+  };
+
+  const handleReset = () => {
+    setEntries([]);
+    setInput('');
+    setSelectedId(null);
+    setFilter('all');
+    setQuery('');
+    flash('已清空当前结果，请重新加载依赖清单。', 'info');
+  };
+
+  const handleExport = () => {
+    if (findings.length === 0) {
+      flash('清单为空，没有可导出的结果：请先加载依赖并完成分析。', 'warn');
+      return;
+    }
+    const markdown = buildMarkdownReport(findings, { distribution, generatedAt: new Date() });
+    const blob = new Blob([markdown], { type: 'text/markdown;charset=utf-8' });
+    const url = URL.createObjectURL(blob);
+    const anchor = document.createElement('a');
+    anchor.href = url;
+    anchor.download = `license-report-${distribution}.md`;
+    anchor.click();
+    URL.revokeObjectURL(url);
+    flash(`已导出 Markdown 报告（${findings.length} 条依赖，${DISTRIBUTION_LABEL[distribution]}）。`, 'ok');
+  };
+
+  const counts: Record<RiskLevel, number> = { pass: 0, review: 0, risk: 0, unknown: 0 };
+  for (const f of findings) counts[f.risk] += 1;
+
+  const metrics: { label: string; value: number; tone: RiskLevel | 'total' }[] = [
+    { label: '已分析依赖', value: findings.length, tone: 'total' },
+    { label: '兼容放行', value: counts.pass, tone: 'pass' },
+    { label: '提醒复核', value: counts.review, tone: 'review' },
+    { label: '高风险', value: counts.risk, tone: 'risk' },
+    { label: '待补录', value: counts.unknown, tone: 'unknown' },
+  ];
+
+  return (
+    <main className="app">
+      <header className="top">
+        <div className="brand">
+          <div className="logo"><Scale size={20} /></div>
+          <div>
+            <h1>License Lens</h1>
+            <small>依赖许可证兼容性分析 · 按开源 / 闭源分发判定风险</small>
+          </div>
+        </div>
+        <div className="top-actions">
+          <div className="mode-switch" role="group" aria-label="分发方式">
+            <button
+              className={distribution === 'open' ? 'active' : ''}
+              onClick={() => setDistribution('open')}
+              title="项目以开源方式分发"
+            >
+              <Globe size={14} />
+              开源分发
+            </button>
+            <button
+              className={distribution === 'closed' ? 'active' : ''}
+              onClick={() => setDistribution('closed')}
+              title="产品以闭源 / 专有方式分发"
+            >
+              <Lock size={14} />
+              闭源分发
+            </button>
+          </div>
+          <button className="ghost" onClick={handleReset} title="清空当前结果">
+            <RotateCcw size={15} />
+            重置
+          </button>
+          <button className="primary" onClick={handleExport}>
+            <Download size={15} />
+            导出 Markdown
+          </button>
+        </div>
+      </header>
+
+      <section className="summary">
+        {metrics.map(metric => (
+          <div key={metric.label} className="metric">
+            <small>{metric.label}</small>
+            <b className={metric.tone === 'total' ? '' : metric.tone}>{metric.value}</b>
+          </div>
+        ))}
+      </section>
+
+      <section className="grid">
+        <ImportPanel
+          input={input}
+          status={status}
+          statusTone={statusTone}
+          analyzing={analyzing}
+          hasFindings={findings.length > 0}
+          onInputChange={setInput}
+          onAnalyze={handleAnalyze}
+          onLoadSample={handleLoadSample}
+          onFileContent={handleFileContent}
+          onAdd={handleAdd}
+        />
+        <ResultsPanel
+          findings={findings}
+          distribution={distribution}
+          filter={filter}
+          query={query}
+          selectedId={selectedId}
+          onFilterChange={setFilter}
+          onQueryChange={setQuery}
+          onSelect={id => setSelectedId(current => (current === id ? null : id))}
+          onSupplement={handleSupplement}
+        />
+      </section>
+    </main>
+  );
 }
